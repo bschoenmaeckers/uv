@@ -137,6 +137,7 @@ class Version(NamedTuple):
 class ImplementationName(StrEnum):
     CPYTHON = "cpython"
     PYPY = "pypy"
+    PIODIDE = "pyodide"
 
 
 class Variant(StrEnum):
@@ -540,6 +541,88 @@ class PyPyFinder(Finder):
             download.sha256 = checksums.get(download.filename)
 
 
+class PyodideFinder(Finder):
+    implementation = ImplementationName.PIODIDE
+    LOCK_URL = "https://cdn.jsdelivr.net/pyodide/v{version}/pyc/pyodide-lock.json"
+    RELEASE_URL = "https://api.github.com/repos/pyodide/pyodide/releases"
+
+    # pyodide-core-0.27.0.tar.bz2
+    _filename_re = re.compile(
+        r"""(?x)
+        ^
+            pyodide-((?P<flavor>core)-)?
+            (?P<version>\d+\.\d+\.\d+)
+            \.tar\.bz2
+        $
+        """
+    )
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+
+    async def find(self) -> list[PythonDownload]:
+        results = {}
+        # Collect all available Python downloads
+        for page in range(1, 20):
+            logging.info("Fetching Pyodide release page %d", page)
+            resp = await self.client.get(
+                self.RELEASE_URL, params={"page": page, "per_page": 10}
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if not rows:
+                break
+
+            for row in rows:
+                # Stop if we reach the oldest release we care about
+                if row["tag_name"] == "0.24.0":
+                    return list(results.values())
+
+                # Sort the assets to ensure deterministic results
+                row["assets"].sort(key=lambda asset: asset["browser_download_url"])
+                for asset in row["assets"]:
+                    url = asset["browser_download_url"]
+                    download = await self._parse_download_url(url)
+                    if download is None:
+                        continue
+
+                    if (download.version, download.flavor) not in results:
+                        logging.debug(
+                            "Found %s (%s)", download.key(), download.filename
+                        )
+                        results[(download.version, download.flavor)] = download
+
+        return list(results.values())
+
+    async def _parse_download_url(self, url: str) -> PythonDownload | None:
+        filename = unquote(url.rsplit("/", maxsplit=1)[-1])
+        match = self._filename_re.match(filename)
+        if match is None:
+            return None
+
+        groups = match.groupdict()
+        version = groups["version"]
+        flavor = groups["flavor"] or "full"
+
+        resp = await self.client.get(self.LOCK_URL.format(version=version))
+        resp.raise_for_status()
+        pyodide_lock = resp.json()
+
+        return PythonDownload(
+            release=version,
+            version=Version.from_str(pyodide_lock["info"]["python"]),
+            triple=PlatformTriple(
+                platform=pyodide_lock["info"]["platform"],
+                arch=Arch(pyodide_lock["info"]["arch"]),
+                libc="none",
+            ),
+            flavor=flavor,
+            implementation=self.implementation,
+            filename=filename,
+            url=url,
+        )
+
+
 def render(downloads: list[PythonDownload]) -> None:
     """Render `download-metadata.json`."""
 
@@ -564,7 +647,11 @@ def render(downloads: list[PythonDownload]) -> None:
 
     def sort_key(download: PythonDownload) -> tuple:
         # Sort by implementation, version (latest first), and then by triple.
-        impl_order = [ImplementationName.CPYTHON, ImplementationName.PYPY]
+        impl_order = [
+            ImplementationName.CPYTHON,
+            ImplementationName.PYPY,
+            ImplementationName.PIODIDE,
+        ]
         prerelease = prerelease_sort_key(download.version.prerelease)
         return (
             impl_order.index(download.implementation),
@@ -622,6 +709,7 @@ async def find() -> None:
     finders = [
         CPythonFinder(client),
         PyPyFinder(client),
+        PyodideFinder(client),
     ]
     downloads = []
 
